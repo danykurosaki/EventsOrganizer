@@ -1,0 +1,12 @@
+[Unit]
+Description=OBOG cena (asistencia)
+After=network.target
+
+[Service]
+WorkingDirectory=/home/dcarrero/Sites/universidad/obog-cena
+ExecStart=/home/dcarrero/.nvm/versions/node/v26.13.1/bin/node --disable-warning=ExperimentalWarning --env-file=.env server.js
+Restart=on-failure
+User=dcarrero
+
+[Install]
+WantedBy=multi-user.target

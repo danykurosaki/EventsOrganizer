@@ -1,0 +1,6 @@
+cohort,name,email,manager_email,role
+1期,Responsable Uno,responsable1@example.com,,manager
+1期,Persona Ejemplo A,persona.a@example.com,responsable1@example.com,
+1期,Persona Ejemplo B,persona.b@example.com,responsable1@example.com,
+2期,Responsable Dos,responsable2@example.com,,manager
+2期,Persona Ejemplo C,persona.c@example.com,responsable2@example.com,
