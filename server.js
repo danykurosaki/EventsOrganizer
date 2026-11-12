@@ -53,9 +53,17 @@ app.use((req, res, next) => {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'same-origin',
     'X-Frame-Options': 'DENY',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
+    'Cross-Origin-Opener-Policy': 'same-origin',
     'Content-Security-Policy':
-      "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'",
+      "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+    ...(BASE_URL.startsWith('https') ? { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } : {}),
   });
+  next();
+});
+// las respuestas de la API contienen datos personales: nunca en caché
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
   next();
 });
 app.use(express.json({ limit: '2mb' }));
@@ -65,13 +73,20 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
+const safeDecode = (v) => {
+  try {
+    return decodeURIComponent(v);
+  } catch {
+    return '';
+  }
+};
 const cookies = (req) =>
   Object.fromEntries(
     (req.headers.cookie || '')
       .split(';')
       .map((c) => c.trim().split('='))
       .filter((p) => p[0])
-      .map(([k, ...v]) => [k, decodeURIComponent(v.join('='))]),
+      .map(([k, ...v]) => [k, safeDecode(v.join('='))]),
   );
 
 function setSessionCookie(res, token, maxAgeSec) {
@@ -207,6 +222,7 @@ function sendCsv(res, name, rows) {
 // Sin SMTP y fuera de producción (modo pruebas) se dan pistas extra; con SMTP real la respuesta es siempre neutra.
 const DEV = !mailEnabled && process.env.NODE_ENV !== 'production';
 // Solo para pruebas locales: muestra el código en pantalla. Exige activarlo a mano Y que BASE_URL sea localhost.
+if (process.env.NODE_ENV === 'production' && !mailEnabled) console.error('AVISO: producción sin SMTP configurado; nadie podrá recibir códigos de acceso.');
 const SHOW_CODE = DEV && process.env.DEV_SHOW_CODE === '1' && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(BASE_URL);
 app.post('/api/auth/request', async (req, res) => {
   const email = normEmail(req.body?.email);
@@ -234,6 +250,8 @@ app.post('/api/auth/verify', (req, res) => {
   const email = normEmail(req.body?.email);
   const code = String(req.body?.code || '').replace(/\D/g, '');
   if (limited(`vip:${req.ip}`, 40, 3600e3)) return res.status(429).json({ error: 'rate' });
+  // tope acumulado por email: pedir códigos nuevos no reinicia este contador
+  if (limited(`vem:${email}`, 15, 3600e3)) return res.status(429).json({ error: 'rate' });
   const row = db.prepare('SELECT * FROM login_code WHERE email = ?').get(email);
   if (!row || row.expires < Date.now()) return res.status(400).json({ error: 'invalid_code' });
   if (row.attempts >= 5) {
@@ -310,6 +328,8 @@ api.put('/events/:eid/team/:id/response', requireRole('manager', 'admin'), (req,
   const ev = eventFor(req);
   const id = Number(req.params.id);
   if (!canEdit(req.user, id)) return res.status(403).json({ error: 'forbidden' });
+  // tras el plazo solo el admin puede modificar respuestas
+  if (isClosed(ev) && req.user.role !== 'admin') return res.status(403).json({ error: 'closed' });
   res.json(saveResponse(id, req.user.id, ev.id, req.body || {}));
 });
 

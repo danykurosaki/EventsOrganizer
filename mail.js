@@ -18,6 +18,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 
 export async function sendCode({ to, name, code, link, title }) {
   if (!transport) {
+    if (process.env.NODE_ENV === 'production') throw new Error('SMTP no configurado');
     console.log(`[mail:dev] código para ${to}: ${code}  (enlace: ${link})`);
     return;
   }
