@@ -9,6 +9,8 @@ export const db = new DatabaseSync(dbFile);
 db.exec(`
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
 
 CREATE TABLE IF NOT EXISTS person (
   id         INTEGER PRIMARY KEY,
@@ -86,6 +88,14 @@ if (legacy) {
            DROP TABLE response_old;`);
 }
 
+// --- historial: columna event_id para poder filtrar la actividad por evento ---
+if (!db.prepare('PRAGMA table_info(log)').all().some((c) => c.name === 'event_id')) {
+  db.exec('ALTER TABLE log ADD COLUMN event_id INTEGER');
+  db.exec(`UPDATE log SET event_id = CASE WHEN json_valid(detail) THEN CAST(json_extract(detail, '$.event') AS INTEGER) END
+           WHERE action IN ('response','response_by_manager')`);
+}
+db.exec('CREATE INDEX IF NOT EXISTS idx_log_event ON log(event_id, id); CREATE INDEX IF NOT EXISTS idx_log_person ON log(person_id);');
+
 export const DEFAULT_EVENT = {
   title: 'OBOG会',
   teacher: '',
@@ -133,6 +143,8 @@ export function setArchived(id, flag) {
   db.prepare('UPDATE events SET archived = ? WHERE id = ?').run(flag ? 1 : 0, id);
 }
 export function deleteEvent(id) {
+  // el historial de respuestas del evento contiene datos personales: se elimina con él
+  db.prepare('DELETE FROM log WHERE event_id = ?').run(id);
   return Number(db.prepare('DELETE FROM events WHERE id = ?').run(id).changes);
 }
 
@@ -155,13 +167,14 @@ export function normEvent(b = {}) {
   };
 }
 
-export function audit(actorId, personId, action, detail = '') {
-  db.prepare('INSERT INTO log (ts, person_id, actor_id, action, detail) VALUES (?,?,?,?,?)').run(
+export function audit(actorId, personId, action, detail = '', eventId = null) {
+  db.prepare('INSERT INTO log (ts, person_id, actor_id, action, detail, event_id) VALUES (?,?,?,?,?,?)').run(
     new Date().toISOString(),
     personId ?? null,
     actorId ?? null,
     action,
     typeof detail === 'string' ? detail : JSON.stringify(detail),
+    eventId,
   );
 }
 

@@ -32,10 +32,11 @@ const PATHS = {
   chart: '<path d="M5 20V10M12 20V4M19 20v-7"/>',
   cal: '<rect x="4" y="5.5" width="16" height="14.5" rx="3"/><path d="M4 10.5h16M8.5 3.5v4M15.5 3.5v4"/>',
   db: '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>',
+  pulse: '<path d="M3 12h4l3-7 4 14 3-7h4"/>',
   ticket: '<path d="M4 8a2 2 0 0 0 0 8v1.5A1.5 1.5 0 0 0 5.5 19h13a1.5 1.5 0 0 0 1.5-1.5V16a2 2 0 0 1 0-8V6.5A1.5 1.5 0 0 0 18.5 5h-13A1.5 1.5 0 0 0 4 6.5V8zM14 5v14" stroke-dasharray="2 2.4"/>',
 };
 const ic = (n) => `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">${PATHS[n]}</svg>`;
-const TABICO = { me: 'user', team: 'users', summary: 'chart', events: 'cal', data: 'db' };
+const TABICO = { me: 'user', team: 'users', activity: 'pulse', summary: 'chart', events: 'cal', data: 'db' };
 const EMO = { yes: ic('yes'), maybe: ic('maybe'), no: ic('no'), pending: ic('pending') };
 
 // ---------- i18n ----------
@@ -53,7 +54,7 @@ const locale = () => (lang === 'ja' ? 'ja-JP' : 'es-ES');
 document.documentElement.dataset.theme = 'dark'; // solo tema oscuro
 
 // ---------- estado ----------
-const state = { me: null, eventId: null, tab: null, team: null, filter: 'all', q: '', cohort: '', editing: null };
+const state = { me: null, eventId: null, tab: null, team: null, filter: 'all', q: '', cohort: '', editing: null, act: null, actPeriod: '7', actAttention: false };
 const app = $('#app');
 let cdTimer = null;
 let saveTimer = null;
@@ -287,8 +288,8 @@ function startCountdown(ev) {
 
 // ---------- layout ----------
 function tabsFor(role) {
-  if (role === 'admin') return [['me', 'tab_me'], ['team', 'tab_all'], ['summary', 'tab_summary'], ['events', 'tab_event'], ['data', 'tab_data']];
-  if (role === 'manager') return [['me', 'tab_me'], ['team', 'tab_team']];
+  if (role === 'admin') return [['me', 'tab_me'], ['team', 'tab_all'], ['activity', 'tab_activity'], ['summary', 'tab_summary'], ['events', 'tab_event'], ['data', 'tab_data']];
+  if (role === 'manager') return [['me', 'tab_me'], ['team', 'tab_team'], ['activity', 'tab_activity']];
   return [];
 }
 
@@ -322,7 +323,7 @@ function render() {
       <div class="brand">${logo()}<span>OBOG会</span></div>
       <div class="chips">${controls()}<button class="icon-btn" id="logout" title="${esc(t('logout'))}">${ic('logout')}<span class="nm-btn">${esc(me.person.name)}</span></button></div>
     </div>
-    ${tabs.length ? `<nav class="tabs">${tabs.map(([k, l]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${ic(TABICO[k])}<span class="t">${esc(t(l))}</span></button>`).join('')}</nav>` : ''}
+    ${tabs.length ? `<nav class="tabs">${tabs.map(([k, l]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${ic(TABICO[k])}<span class="t">${esc(t(l))}</span>${k === 'activity' ? '<i class="badge" hidden></i>' : ''}</button>`).join('')}</nav>` : ''}
     ${switcher()}
     ${showEvent ? eventCard(ev, state.tab === 'team') : ''}
     <div id="view"></div>
@@ -333,8 +334,9 @@ function render() {
   $$('[data-tab]').forEach((b) => (b.onclick = () => { state.tab = b.dataset.tab; state.editing = null; render(); }));
   $$('[data-ev]').forEach((b) => (b.onclick = () => { state.eventId = Number(b.dataset.ev); store.set('event', state.eventId); state.team = null; render(); }));
   if (showEvent) startCountdown(ev); else clearInterval(cdTimer);
-  const views = { me: viewMine, team: viewTeam, summary: viewSummary, events: viewEvents, data: viewData };
+  const views = { me: viewMine, team: viewTeam, activity: viewActivity, summary: viewSummary, events: viewEvents, data: viewData };
   views[state.tab]();
+  if (me.person.role !== 'member' && state.tab !== 'activity' && state.tab !== 'team') loadActivity().then(updateBadge).catch(() => {});
 }
 
 async function refreshMe(keepEvent = true) {
@@ -465,6 +467,7 @@ async function viewTeam() {
   if (add) add.onclick = () => personDialog(null);
   renderTeamStats();
   renderTeamList();
+  loadActivity().then(() => { renderActBanner(); updateBadge(); }).catch(() => {});
 }
 
 const hue = (s) => [...String(s)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
@@ -606,6 +609,142 @@ function personDialog(p) {
       toast(t('saved'));
     } catch (er) { err.textContent = t('err_' + (er.code || 'generic')); }
   };
+}
+
+// ---------- actividad (responsables y admin) ----------
+const seenKey = () => `act_seen_${state.eventId}`;
+async function loadActivity() {
+  const evId = state.eventId;
+  if (!evId) return null;
+  const d = await api('GET', `/events/${evId}/activity?days=30`);
+  state.act = { evId, ...d, groups: groupActivity(d.items), at: Date.now() };
+  return state.act;
+}
+const dayKey = (d) => d.toLocaleDateString('en-CA'); // AAAA-MM-DD en hora local de quien mira
+
+// una fila por persona y día: de lo primero que tenía ese día a cómo ha quedado
+function groupActivity(items) {
+  const map = new Map();
+  for (const it of items.slice().reverse()) { // de más antiguo a más reciente
+    const key = `${dayKey(new Date(it.ts))}|${it.person_id}`;
+    let g = map.get(key);
+    if (!g) map.set(key, (g = { key, day: dayKey(new Date(it.ts)), person_id: it.person_id, name: it.name, cohort: it.cohort, changes: {}, n: 0, actors: new Set(), by_manager: false }));
+    for (const [k, [from, to]] of Object.entries(it.changes)) g.changes[k] = [g.changes[k] ? g.changes[k][0] : from, to];
+    g.ts = it.ts;
+    g.n++;
+    g.by_manager ||= it.by_manager;
+    if (it.by_manager && it.actor) g.actors.add(it.actor);
+  }
+  const out = [];
+  for (const g of map.values()) {
+    for (const k of Object.keys(g.changes)) if ((g.changes[k][0] ?? null) === (g.changes[k][1] ?? null)) delete g.changes[k]; // ida y vuelta: sin cambio neto
+    if (Object.keys(g.changes).length) out.push(g);
+  }
+  return out.sort((a, b) => b.ts.localeCompare(a.ts));
+}
+const needsAttention = (g) => {
+  const a = g.changes.answer;
+  return !!a && ((a[0] === 'yes' && (a[1] === 'no' || a[1] === 'maybe')) || (a[0] === 'maybe' && a[1] === 'no'));
+};
+const todayGroups = () => (state.act?.groups || []).filter((g) => g.day === dayKey(new Date()));
+const unseenGroups = () => {
+  const seen = store.get(seenKey()) || '';
+  return (state.act?.groups || []).filter((g) => g.ts > seen && !(g.person_id === state.me.person.id && !g.by_manager));
+};
+
+function updateBadge() {
+  const b = $('[data-tab=activity] .badge');
+  if (!b || state.act?.evId !== state.eventId) return;
+  const n = unseenGroups().length;
+  b.hidden = !n;
+  b.textContent = n > 99 ? '99+' : n;
+}
+
+function actSummaryHtml() {
+  const tg = todayGroups();
+  const tally = { yes: 0, maybe: 0, no: 0 };
+  for (const g of tg) if (g.changes.answer && tally[g.changes.answer[1]] !== undefined) tally[g.changes.answer[1]]++;
+  const sc = state.act.scope;
+  const head = !tg.length ? t('act_today_none') : tg.length === 1 ? t('act_today_one') : t('act_today_n', { n: tg.length });
+  return `<div class="act-sum ${tg.length ? 'live' : ''}"><div class="big"><b>${tg.length}</b><span>${esc(head)}</span></div>
+    ${tg.length ? `<div class="tally">${['yes', 'maybe', 'no'].filter((k) => tally[k]).map((k) => `<span class="pill ${k}">${EMO[k]} ${tally[k]}</span>`).join('')}</div>` : ''}
+    <div class="small muted">${esc(t('act_pending_of', { p: sc.pending, n: sc.people }))}</div></div>`;
+}
+
+function actEntryHtml(g, fresh) {
+  const c = g.changes;
+  const time = new Date(g.ts).toLocaleTimeString(locale(), { hour: '2-digit', minute: '2-digit' });
+  const st = c.answer ? c.answer[1] || 'pending' : 'x';
+  const pill = (a) => `<span class="pill ${a || 'pending'}">${EMO[a || 'pending']} ${esc(t(a || 'pending'))}</span>`;
+  const bits = [];
+  if (c.nijikai) bits.push(t(c.nijikai[1] ? 'act_nijikai_on' : 'act_nijikai_off'));
+  if (c.companions) bits.push(t('act_companions', { a: c.companions[0], b: c.companions[1] }));
+  if (c.kids) bits.push(t('act_kids', { a: c.kids[0], b: c.kids[1] }));
+  const att = needsAttention(g) ? `<span class="tag warn">${esc(t(c.answer[1] === 'no' ? 'act_drop' : 'act_doubt'))}</span>` : '';
+  const first = c.answer && c.answer[0] === null ? `<span class="small muted">${esc(t('act_first'))}</span>` : '';
+  return `<div class="act ${fresh ? 'fresh' : ''} ${att ? 'att' : ''}" data-st="${st}">
+    <div class="av" style="--h:${hue(g.name)}">${esc(initials(g.name))}</div>
+    <div class="body">
+      <div class="top"><span class="nm">${esc(g.name)}</span>${g.cohort ? `<span class="small muted">${esc(g.cohort)}</span>` : ''}${fresh ? `<span class="tag">${esc(t('act_new'))}</span>` : ''}${att}<time class="small muted">${esc(time)}</time></div>
+      ${c.answer ? `<div class="flow">${c.answer[0] === null ? '' : pill(c.answer[0]) + '<span class="arrow" aria-hidden="true">→</span>'}${pill(c.answer[1])} ${first}</div>` : ''}
+      ${bits.length ? `<div class="small">${bits.map(esc).join(' · ')}</div>` : ''}
+      ${c.note ? `<div class="note">${ic('note')}<span>${c.note[1] ? esc(c.note[1]) : `<em>${esc(t('act_note_removed'))}</em>`}</span></div>` : ''}
+      ${g.n > 1 || g.by_manager ? `<div class="small muted">${g.by_manager ? ic('edit') + ' ' + esc(g.actors.size ? t('act_by', { name: [...g.actors].join(', ') }) : t('changed_by_manager')) : ''}${g.n > 1 ? `${g.by_manager ? ' · ' : ''}${esc(t('act_changes', { n: g.n }))}` : ''}</div>` : ''}
+    </div></div>`;
+}
+
+function dayLabel(day) {
+  const now = new Date();
+  if (day === dayKey(now)) return t('act_day_today');
+  if (day === dayKey(new Date(now.getTime() - 864e5))) return t('act_day_yesterday');
+  return new Date(`${day}T12:00:00`).toLocaleDateString(locale(), { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
+async function viewActivity() {
+  if (!curEvent()) { $('#view').innerHTML = noEvents(); return; }
+  const evId = state.eventId;
+  $('#view').innerHTML = `<section class="card" id="actcard"><p class="muted">…</p></section>`;
+  const seenBefore = store.get(seenKey()) || '';
+  try { await loadActivity(); } catch (e) { toast(t('err_' + (e.code || 'generic')), true); return; }
+  if (evId !== state.eventId || state.tab !== 'activity') return;
+  const draw = () => {
+    const days = { today: 1, 7: 7, 30: 30 }[state.actPeriod] || 7;
+    const from = dayKey(new Date(Date.now() - (days - 1) * 864e5));
+    const self = state.me.person.id;
+    const rows = state.act.groups.filter((g) => g.day >= from && (!state.actAttention || needsAttention(g)));
+    let html = '';
+    let last = null;
+    for (const g of rows) {
+      if (g.day !== last) { last = g.day; html += `<div class="cohort-head"><span>${esc(dayLabel(g.day))}</span></div>`; }
+      html += actEntryHtml(g, g.ts > seenBefore && !(g.person_id === self && !g.by_manager));
+    }
+    $('#actlist').innerHTML = html || `<p class="muted">${esc(t('act_none'))}</p>`;
+    $('#actf').innerHTML = [['today', t('act_period_today')], ['7', t('act_period_7')], ['30', t('act_period_30')]].map(([k, l]) => `<button class="chip ${state.actPeriod === k ? 'on' : ''}" data-p="${k}">${esc(l)}</button>`).join('')
+      + `<button class="chip ${state.actAttention ? 'on' : ''}" data-att>${esc(t('act_attention'))}</button>`;
+    $$('[data-p]', $('#actf')).forEach((b) => (b.onclick = () => { state.actPeriod = b.dataset.p; draw(); }));
+    $('[data-att]', $('#actf')).onclick = () => { state.actAttention = !state.actAttention; draw(); };
+  };
+  $('#actcard').innerHTML = `<div class="row spread"><h2 style="margin:0">${esc(t('act_title'))}</h2><button class="btn ghost sm" id="actref">${esc(t('act_refresh'))}</button></div>
+    <p class="muted small" style="margin:6px 0 14px">${esc(t('act_hint'))}</p>
+    ${actSummaryHtml()}<div class="filters" id="actf"></div><div class="people" id="actlist"></div>`;
+  $('#actref').onclick = () => viewActivity();
+  draw();
+  store.set(seenKey(), new Date().toISOString());
+  updateBadge();
+}
+
+function renderActBanner() {
+  const card = $('#teamcard');
+  if (!card || state.tab !== 'team' || state.act?.evId !== state.eventId || $('#actbanner')) return;
+  const tg = todayGroups();
+  const n = unseenGroups().length;
+  if (!tg.length) return;
+  const el = document.createElement('button');
+  el.id = 'actbanner';
+  el.className = 'act-banner';
+  el.innerHTML = `${ic('pulse')}<span>${esc(tg.length === 1 ? t('act_today_one') : t('act_today_n', { n: tg.length }))}</span>${n ? `<i class="badge">${n}</i>` : ''}<b>${esc(t('act_see_all'))} →</b>`;
+  el.onclick = () => { state.tab = 'activity'; render(); };
+  card.prepend(el);
 }
 
 // ---------- resumen (admin) ----------

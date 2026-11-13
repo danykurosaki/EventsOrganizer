@@ -14,19 +14,23 @@ const SESSION_DAYS = 60;
 const CODE_TTL = 10 * 60 * 1000;
 const COOKIE = 'obog_session';
 
-if (SECRET === 'dev-secret-change-me' && process.env.NODE_ENV === 'production') {
-  console.error('APP_SECRET es obligatorio en producción');
+if (process.env.NODE_ENV === 'production' && (SECRET === 'dev-secret-change-me' || SECRET.length < 32)) {
+  console.error('APP_SECRET es obligatorio en producción (mínimo 32 caracteres aleatorios)');
   process.exit(1);
 }
 
 const sha = (s) => crypto.createHash('sha256').update(`${s}|${SECRET}`).digest('hex');
 const normEmail = (e) => String(e || '').trim().toLowerCase();
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const validEmail = (e) => e.length <= 254 && EMAIL_RE.test(e);
+const clip = (v, n) => String(v ?? '').trim().slice(0, n);
 
 // ---------- rate limit en memoria ----------
 const hits = new Map();
 function limited(key, max, windowMs) {
   const now = Date.now();
+  // tope de claves para que un atacante no pueda inflar la memoria con emails inventados
+  if (hits.size > 50000 && !hits.has(key)) return true;
   const arr = (hits.get(key) || []).filter((t) => now - t < windowMs);
   if (arr.length >= max) {
     hits.set(key, arr);
@@ -62,6 +66,14 @@ app.use((req, res, next) => {
   next();
 });
 // las respuestas de la API contienen datos personales: nunca en caché
+app.get('/healthz', (req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    res.set('Cache-Control', 'no-store').json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
 app.use('/api', (req, res, next) => {
   res.set('Cache-Control', 'no-store');
   next();
@@ -136,6 +148,9 @@ function getResponse(personId, eventId) {
 
 function saveResponse(personId, actorId, eventId, input) {
   const next = normResponse(input);
+  return tx(() => saveResponseTx(personId, actorId, eventId, next));
+}
+function saveResponseTx(personId, actorId, eventId, next) {
   const prev = getResponse(personId, eventId);
   const changed = ['answer', 'nijikai', 'companions', 'kids', 'note'].filter((k) => (prev[k] ?? null) !== (next[k] ?? null));
   if (!changed.length) return prev;
@@ -146,7 +161,7 @@ function saveResponse(personId, actorId, eventId, input) {
      ON CONFLICT(person_id, event_id) DO UPDATE SET answer=excluded.answer, nijikai=excluded.nijikai, companions=excluded.companions,
        kids=excluded.kids, note=excluded.note, updated_by=excluded.updated_by, updated_at=excluded.updated_at, by_manager=excluded.by_manager`,
   ).run(personId, eventId, next.answer, next.nijikai, next.companions, next.kids, next.note, actorId, new Date().toISOString(), byManager);
-  audit(actorId, personId, byManager ? 'response_by_manager' : 'response', { event: eventId, ...Object.fromEntries(changed.map((k) => [k, [prev[k] ?? null, next[k] ?? null]])) });
+  audit(actorId, personId, byManager ? 'response_by_manager' : 'response', { event: eventId, ...Object.fromEntries(changed.map((k) => [k, [prev[k] ?? null, next[k] ?? null]])) }, eventId);
   return getResponse(personId, eventId);
 }
 
@@ -226,7 +241,7 @@ if (process.env.NODE_ENV === 'production' && !mailEnabled) console.error('AVISO:
 const SHOW_CODE = DEV && process.env.DEV_SHOW_CODE === '1' && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(BASE_URL);
 app.post('/api/auth/request', async (req, res) => {
   const email = normEmail(req.body?.email);
-  if (!EMAIL_RE.test(email)) return res.json({ ok: true });
+  if (!validEmail(email)) return res.json({ ok: true });
   if (limited(`ip:${req.ip}`, 20, 3600e3) || limited(`mail:${email}`, 8, 3600e3)) return res.json({ ok: true, wait: true });
   // el enfriamiento se aplica igual a emails existentes y desconocidos: no revela nada
   if (limited(`mail1:${email}`, 1, 30e3)) return res.json({ ok: true, wait: true });
@@ -318,6 +333,36 @@ api.get('/events/:eid/team', requireRole('manager', 'admin'), (req, res) => {
   res.json({ people: rows, stats: computeStats(rows, ev) });
 });
 
+// ----- actividad: últimos cambios de respuesta de mis personas (admin: todas) -----
+const ACT_FIELDS = ['answer', 'nijikai', 'companions', 'kids', 'note'];
+api.get('/events/:eid/activity', requireRole('manager', 'admin'), (req, res) => {
+  const ev = eventFor(req);
+  const days = Math.min(90, Math.max(1, parseInt(req.query.days, 10) || 14));
+  const since = new Date(Date.now() - days * 864e5).toISOString();
+  const isAdmin = req.user.role === 'admin';
+  const rows = db
+    .prepare(
+      `SELECT l.id, l.ts, l.person_id, l.actor_id, l.action, l.detail, p.name, p.cohort, a.name AS actor
+       FROM log l JOIN person p ON p.id = l.person_id LEFT JOIN person a ON a.id = l.actor_id
+       WHERE l.event_id = ? AND l.ts >= ? AND l.action IN ('response', 'response_by_manager')
+         ${isAdmin ? '' : 'AND (p.manager_id = ? OR p.id = ?)'}
+       ORDER BY l.id DESC LIMIT 1500`,
+    )
+    .all(ev.id, since, ...(isAdmin ? [] : [req.user.id, req.user.id]));
+  const items = [];
+  for (const r of rows) {
+    let d;
+    try { d = JSON.parse(r.detail); } catch { continue; }
+    const changes = {};
+    for (const k of ACT_FIELDS) if (Array.isArray(d?.[k])) changes[k] = d[k];
+    if (!Object.keys(changes).length) continue;
+    items.push({ id: r.id, ts: r.ts, person_id: r.person_id, name: r.name, cohort: r.cohort, actor: r.actor || '', by_manager: r.action === 'response_by_manager', changes });
+  }
+  const people = listPeople(req.user, ev.id);
+  const s = computeStats(people, ev).total;
+  res.json({ items, days, scope: { people: s.total, pending: s.pending, yes: s.yes, maybe: s.maybe, no: s.no } });
+});
+
 function canEdit(actor, targetId) {
   const t = db.prepare('SELECT id, manager_id FROM person WHERE id = ?').get(targetId);
   if (!t) return false;
@@ -384,15 +429,22 @@ admin.delete('/events/:eid', (req, res) => {
   res.json({ deleted: 1 });
 });
 
+function managerIdOf(v, selfId) {
+  if (v === null || v === undefined || v === '') return null;
+  const id = Number(v);
+  if (!Number.isInteger(id) || id === selfId || !db.prepare('SELECT 1 FROM person WHERE id = ?').get(id)) throw httpError(400, 'invalid');
+  return id;
+}
+
 admin.post('/person', (req, res) => {
   const b = req.body || {};
   const email = normEmail(b.email);
-  if (!EMAIL_RE.test(email) || !String(b.name || '').trim()) return res.status(400).json({ error: 'invalid' });
+  if (!validEmail(email) || !clip(b.name, 120)) return res.status(400).json({ error: 'invalid' });
   if (db.prepare('SELECT 1 FROM person WHERE email = ?').get(email)) return res.status(409).json({ error: 'exists' });
   const role = ['member', 'manager', 'admin'].includes(b.role) ? b.role : 'member';
   const r = db
     .prepare('INSERT INTO person (cohort, name, email, role, manager_id, note) VALUES (?,?,?,?,?,?)')
-    .run(String(b.cohort || '').trim(), String(b.name).trim(), email, role, b.manager_id ? Number(b.manager_id) : null, String(b.pnote || '').slice(0, 300));
+    .run(clip(b.cohort, 40), clip(b.name, 120), email, role, managerIdOf(b.manager_id, null), String(b.pnote || '').slice(0, 300));
   audit(req.user.id, Number(r.lastInsertRowid), 'person_create', email);
   res.json({ id: Number(r.lastInsertRowid) });
 });
@@ -403,16 +455,15 @@ admin.put('/person/:id', (req, res) => {
   const cur = db.prepare('SELECT * FROM person WHERE id = ?').get(id);
   if (!cur) return res.status(404).json({ error: 'not_found' });
   const email = b.email !== undefined ? normEmail(b.email) : cur.email;
-  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'invalid' });
+  if (!validEmail(email)) return res.status(400).json({ error: 'invalid' });
   const clash = db.prepare('SELECT id FROM person WHERE email = ? AND id <> ?').get(email, id);
   if (clash) return res.status(409).json({ error: 'exists' });
   const role = ['member', 'manager', 'admin'].includes(b.role) ? b.role : cur.role;
   if (id === req.user.id && role !== 'admin') return res.status(400).json({ error: 'self_demote' });
-  const mid = b.manager_id === undefined ? cur.manager_id : b.manager_id ? Number(b.manager_id) : null;
-  if (mid === id) return res.status(400).json({ error: 'invalid' });
+  const mid = b.manager_id === undefined ? cur.manager_id : managerIdOf(b.manager_id, id);
   db.prepare('UPDATE person SET cohort=?, name=?, email=?, role=?, manager_id=?, note=? WHERE id=?').run(
-    b.cohort !== undefined ? String(b.cohort).trim() : cur.cohort,
-    b.name !== undefined ? String(b.name).trim() || cur.name : cur.name,
+    b.cohort !== undefined ? clip(b.cohort, 40) : cur.cohort,
+    b.name !== undefined ? clip(b.name, 120) || cur.name : cur.name,
     email,
     role,
     mid,
@@ -435,6 +486,7 @@ admin.delete('/person/:id', (req, res) => {
 admin.post('/import', (req, res) => {
   const rows = parseCsv(req.body?.csv);
   if (rows.length < 2) return res.status(400).json({ error: 'empty' });
+  if (rows.length > 5001) return res.status(400).json({ error: 'too_large' });
   const alias = { cohort: 'cohort', 期: 'cohort', name: 'name', 名前: 'name', email: 'email', mail: 'email', manager_email: 'manager_email', manager: 'manager_email', role: 'role' };
   const header = rows[0].map((h) => alias[h.trim().toLowerCase()] || h.trim().toLowerCase());
   if (!header.includes('name') || !header.includes('email')) return res.status(400).json({ error: 'missing_columns' });
@@ -445,15 +497,15 @@ admin.post('/import', (req, res) => {
     rows.slice(1).forEach((r, i) => {
       const o = Object.fromEntries(header.map((h, j) => [h, (r[j] ?? '').trim()]));
       const email = normEmail(o.email);
-      if (!EMAIL_RE.test(email) || !o.name) return report.errors.push({ line: i + 2, error: 'invalid', value: o.email || o.name });
+      if (!validEmail(email) || !o.name) return report.errors.push({ line: i + 2, error: 'invalid', value: o.email || o.name });
       const role = ['member', 'manager', 'admin'].includes(o.role) ? o.role : null;
       const cur = db.prepare('SELECT id, role FROM person WHERE email = ?').get(email);
       if (cur) {
-        db.prepare('UPDATE person SET cohort=?, name=?, role=? WHERE id=?').run(o.cohort || '', o.name, role || cur.role, cur.id);
+        db.prepare('UPDATE person SET cohort=?, name=?, role=? WHERE id=?').run(clip(o.cohort, 40), clip(o.name, 120), role || cur.role, cur.id);
         report.updated++;
         seen.push(cur.id);
       } else {
-        const ins = db.prepare('INSERT INTO person (cohort, name, email, role) VALUES (?,?,?,?)').run(o.cohort || '', o.name, email, role || 'member');
+        const ins = db.prepare('INSERT INTO person (cohort, name, email, role) VALUES (?,?,?,?)').run(clip(o.cohort, 40), clip(o.name, 120), email, role || 'member');
         report.created++;
         seen.push(Number(ins.lastInsertRowid));
       }
@@ -518,7 +570,7 @@ admin.get('/log', (req, res) => {
     .prepare(
       `SELECT l.ts, a.name AS actor, p.name AS person, l.action, l.detail FROM log l
        LEFT JOIN person a ON a.id = l.actor_id LEFT JOIN person p ON p.id = l.person_id
-       WHERE l.action <> 'login' ORDER BY l.id DESC LIMIT 100`,
+       WHERE l.action NOT IN ('login', 'response', 'response_by_manager') ORDER BY l.id DESC LIMIT 100`,
     )
     .all()
     .map((r) => ({ ...r }));
@@ -533,17 +585,41 @@ app.use(express.static(path.join(import.meta.dirname, 'public'), { extensions: [
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
-  if (err.status) return res.status(err.status).json({ error: err.error });
+  // errores de body-parser (JSON mal formado, cuerpo demasiado grande…)
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'too_large' });
+  if (err.status && err.status < 500) return res.status(err.status).json({ error: err.error || 'bad_request' });
   console.error(err);
   res.status(500).json({ error: 'server' });
 });
 
 // ---------- admins iniciales ----------
 for (const e of (process.env.ADMIN_EMAILS || '').split(',').map(normEmail).filter(Boolean)) {
-  if (!EMAIL_RE.test(e)) continue;
+  if (!validEmail(e)) continue;
   const cur = db.prepare('SELECT id FROM person WHERE email = ?').get(e);
   if (cur) db.prepare("UPDATE person SET role = 'admin' WHERE id = ?").run(cur.id);
   else db.prepare("INSERT INTO person (cohort, name, email, role) VALUES ('', ?, ?, 'admin')").run(e.split('@')[0], e);
 }
 
-app.listen(PORT, HOST, () => console.log(`OBOG cena escuchando en http://${HOST}:${PORT}`));
+const server = app.listen(PORT, HOST, () => console.log(`OBOG cena escuchando en http://${HOST}:${PORT}`));
+server.on('error', (e) => {
+  console.error('No se pudo abrir el puerto:', e.message);
+  process.exit(1);
+});
+server.requestTimeout = 30e3;
+server.headersTimeout = 15e3;
+
+// cierre limpio: deja de aceptar conexiones y cierra SQLite (checkpoint del WAL)
+let closing = false;
+function shutdown(sig) {
+  if (closing) return;
+  closing = true;
+  console.log(`${sig}: cerrando…`);
+  server.close(() => {
+    try { db.close(); } catch { /* ya cerrada */ }
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 8000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));

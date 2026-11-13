@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server.js",
-    "dev": "node --disable-warning=ExperimentalWarning --watch server.js"
+    "dev": "DEV_SHOW_CODE=1 node --disable-warning=ExperimentalWarning --watch server.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
